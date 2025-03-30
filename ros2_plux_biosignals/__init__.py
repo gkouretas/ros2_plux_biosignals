@@ -38,5 +38,5 @@ PLUX_PATH = f"{PLUX_API_PATH}/{osDic[platform.system()]}"
 sys.path.append(PLUX_PATH)
 
 # Create module node
-rclpy.init()
-create_simple_node(PLUX_ROS_NODE)
+# rclpy.init()
+# create_simple_node(PLUX_ROS_NODE)
