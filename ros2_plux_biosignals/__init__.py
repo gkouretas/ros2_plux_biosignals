@@ -9,7 +9,6 @@ sys.path.append("~/ros2_ws")
 sys.path.append(os.path.dirname(__file__))
 
 from plux_configs import *
-from python_utils.ros2_utils.comms.node_manager import create_simple_node
 
 # Import plux API
 PLUX_API_PATH = "thirdparty/plux/python-samples/PLUX-API-Python3"
@@ -36,7 +35,3 @@ if platform.mac_ver()[0] != "":
             
 PLUX_PATH = f"{PLUX_API_PATH}/{osDic[platform.system()]}"
 sys.path.append(PLUX_PATH)
-
-# Create module node
-# rclpy.init()
-# create_simple_node(PLUX_ROS_NODE)
