@@ -25,7 +25,7 @@ from std_msgs.msg import Header
 
 from typing import Callable
 
-log_publisher = None
+_RECONNECTION_SLEEP = 5.0
 
 PLUX_SENSORS_PROCESSING_FUNCTIONS: dict[PluxSensor, Callable[[int], float]] = \
     {
@@ -38,16 +38,21 @@ class MyPluxDevice(plux.SignalsDev):
     def __init__(self, address: str):
         plux.SignalsDev.__init__(address)
 
+        self._node = get_node(PLUX_ROS_NODE)
         self.table: list[PluxSensor] = []
-        self.plux_publisher = get_node(PLUX_ROS_NODE).create_publisher(PluxMsg, PLUX_ROS_TOPIC_NAME, get_realtime_qos_profile())
+        self.plux_publisher = None
+        
         self._setup_sensor_table()
         self._frame = -1
 
+    def set_publisher(self, publisher: rclpy.publisher.Publisher):
+        self.plux_publisher = publisher
+        
     def _setup_sensor_table(self):
         for sensor in self.getSensors().values():
             sensor_type = PluxSensor(sensor.clas)
             if not sensor_type in PLUX_SENSORS_PROCESSING_FUNCTIONS.keys():
-                print(f"{sensor_type.name} not supported")
+                self._node.get_logger().warning(f"{sensor_type.name} not supported")
             else:
                 self.table.append(sensor_type)
 
@@ -56,10 +61,10 @@ class MyPluxDevice(plux.SignalsDev):
         plux_msg.world_timestamp = time.time()
 
         if nSeq == 0:
-            print(f"First frame received")
+            self._node.get_logger().info(f"First frame received")
         
         if self._frame + 1 != nSeq: 
-            print(f"Publisher frame skip {self._frame} {nSeq}")
+            self._node.get_logger().warning(f"Publisher frame skip {self._frame} {nSeq}")
             
         self._frame = nSeq
 
@@ -78,40 +83,58 @@ class MyPluxDevice(plux.SignalsDev):
 
 class MyPluxThread(threading.Thread):
     def __init__(self, log_publisher: rclpy.publisher.Publisher, **kwargs):
-        threading.Thread.__init__(self, **kwargs)
+        super().__init__(**kwargs)
+
+
+        self._signal = threading.Event()
+        self._node = get_node(PLUX_ROS_NODE)
+        self._publisher = self._node.create_publisher(PluxMsg, PLUX_ROS_TOPIC_NAME, get_realtime_qos_profile())
 
         self.publisher = log_publisher
-        self.plux_device = MyPluxDevice(PLUX_DEVICE_MAC_ADDRESS)
 
-        self.plux_device.start(PLUX_SAMPLING_FREQUENCY, PLUX_DEVICE_CHANNELS, PLUX_RESOLUTION_BITS)
+        self.plux_device = self._initialize_plux_device()
         
+        self._node.get_logger().info(f"Plux device started : version {plux.version}")
         self.publisher.publish(
             Header(frame_id = "Plux Info: Plux Started")
         )
 
-        get_node(PLUX_ROS_NODE).get_logger().info("Plux device started")
+        self._signal.set()
+
+    def _initialize_plux_device(self):
+        while True:
+            try:
+                device = MyPluxDevice(PLUX_DEVICE_MAC_ADDRESS)
+                device.set_publisher(self._publisher)
+                device.start(PLUX_SAMPLING_FREQUENCY, PLUX_DEVICE_CHANNELS, PLUX_RESOLUTION_BITS)
+
+                return device
+            except RuntimeError as e:
+                self._node.get_logger().info(f"Waiting for connection [err: {e}]...")
+                time.sleep(_RECONNECTION_SLEEP)
 
     def run(self):
-        try:
-            self.plux_device.loop()
-        except Exception as e:
-            self.publisher.publish(
-                Header(frame_id=f"Plux Error: Plux Stopped due to error: {e}")
-            )
+        self._signal.wait()
+        while self._signal.is_set():
+            try:
+                self.plux_device.loop()
+            except RuntimeError:
+                self._node.get_logger().warning("Lost connection to plux, attempting to reconnect...")
 
-            traceback.print_exc()
+                self.plux_device = self._initialize_plux_device()
 
-            time.sleep(2)
+                self._node.get_logger().info("Re-established connection")
 
     def signal_handler(self, sig, frame):
-        print("You pressed Ctrl+C!")
         self.publisher.publish(
             Header(
                 frame_id=f"Plux Info: Plux Stopped by PI"
             )
         )
 
-        time.sleep(2)
+        self._signal.clear()
+        self.join(timeout=2)
+        
         sys.exit(0)
 
 

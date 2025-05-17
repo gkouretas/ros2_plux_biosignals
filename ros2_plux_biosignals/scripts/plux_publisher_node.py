@@ -18,7 +18,7 @@ def main() -> None:
     node = create_simple_node(PLUX_ROS_NODE)
     log_publisher = node.create_publisher(Header, PLUX_ROS_DEBUG_PUBLISHER, 0)
     plux_thread = MyPluxThread(log_publisher)
-    signal.signal(signal.SIGINT, plux_thread.signal_handler)
+    # signal.signal(signal.SIGINT, plux_thread.signal_handler)
     plux_thread.start()
     rclpy.spin(node)
 
