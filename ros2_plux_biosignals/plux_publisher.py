@@ -19,13 +19,16 @@ from plux_configs import *
 from plux_processing import *
 from plux_typedefs import *
 from idl_definitions.msg import PluxMsg
+from idl_definitions.msg import PluxSensor as PluxSensor_
 from python_utils.ros2_utils.comms.node_manager import get_node, get_realtime_qos_profile
 
+import rclpy.timer
 from std_msgs.msg import Header
 
 from typing import Callable
+from collections import deque
 
-_RECONNECTION_SLEEP = 5.0
+_RECONNECTION_SLEEP = 1.0
 
 PLUX_SENSORS_PROCESSING_FUNCTIONS: dict[PluxSensor, Callable[[int], float]] = \
     {
@@ -35,26 +38,79 @@ PLUX_SENSORS_PROCESSING_FUNCTIONS: dict[PluxSensor, Callable[[int], float]] = \
     }
 
 class MyPluxDevice(plux.SignalsDev):
+    @staticmethod
+    def connect(address: str, publisher: rclpy.publisher.Publisher) -> MyPluxDevice:
+        while True:
+            try:
+                device = MyPluxDevice(address)
+                device.set_publisher(publisher)
+                device.start(PLUX_SAMPLING_FREQUENCY, PLUX_DEVICE_CHANNELS, PLUX_RESOLUTION_BITS)
+
+                return device
+            except RuntimeError as e:
+                get_node(PLUX_ROS_NODE).get_logger().info(f"Waiting for connection [err: {e}]...")
+                time.sleep(_RECONNECTION_SLEEP)
+
     def __init__(self, address: str):
         plux.SignalsDev.__init__(address)
 
         self._node = get_node(PLUX_ROS_NODE)
-        self.table: list[PluxSensor] = []
-        self.plux_publisher = None
+        self._table: dict[PluxSensor, list[int]] = {}
+        self._plux_publisher = None
         
         self._setup_sensor_table()
         self._frame = -1
+        self._queue = deque[PluxMsg]()
+        self._thread = threading.Thread(target=self.loop)
+        self._lock = threading.Lock()
+        self._timer: rclpy.timer.Timer = None
+        self._signal = threading.Event()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass   
+
+    def run(self):
+        self._thread.start()
+        self._signal.wait()
+
+        self._timer = self._node.create_timer(
+            (1.0/PLUX_SAMPLING_FREQUENCY) / 2.0,
+            callback=self.process_data
+        )
+
+    def process_data(self):
+        if not self._thread.is_alive():
+            self._node.get_logger().error("Process thread not alive, canceling publisher")
+            self._timer.cancel()
+
+        data = None
+        try:
+            with self._lock:
+                if len(self._queue) > 0:
+                    data = self._queue.popleft()
+                    self._plux_publisher.publish(data)
+                    data = None
+        except RuntimeError as e:
+            self._node.get_logger().error(f"Error publishing: {e}")
+            
+            # Re-insert data into the queue if it was not able to be published...
+            if data is not None: self._queue.appendleft(data)
 
     def set_publisher(self, publisher: rclpy.publisher.Publisher):
-        self.plux_publisher = publisher
+        self._plux_publisher = publisher
         
     def _setup_sensor_table(self):
-        for sensor in self.getSensors().values():
+        for port, sensor in enumerate(self.getSensors().values()):
             sensor_type = PluxSensor(sensor.clas)
             if not sensor_type in PLUX_SENSORS_PROCESSING_FUNCTIONS.keys():
                 self._node.get_logger().warning(f"{sensor_type.name} not supported")
             else:
-                self.table.append(sensor_type)
+                self._node.get_logger().info(f"Sensor {sensor_type} at port index {port}")
+                if sensor_type not in self._table.keys(): self._table[sensor_type] = []
+                self._table[sensor_type].append(port)
 
     def onRawFrame(self, nSeq, data):
         plux_msg = PluxMsg()
@@ -71,13 +127,16 @@ class MyPluxDevice(plux.SignalsDev):
         plux_msg.frame = nSeq
         plux_msg.source_timestamp = nSeq / PLUX_SAMPLING_FREQUENCY
         
-        for channel_index, sensor_type in enumerate(self.table):
-            plux_msg.__setattr__(
-                sensor_type.name.lower(), 
-                PLUX_SENSORS_PROCESSING_FUNCTIONS[sensor_type](data[channel_index])
-            )
+        for sensor_type, channel_indices in self._table.items():
+            plux_msg.__setattr__(sensor_type.name.lower(), [
+                PluxSensor_(
+                    port=channel_index,
+                    value=PLUX_SENSORS_PROCESSING_FUNCTIONS[sensor_type](data[channel_index])
+                ) for channel_index in channel_indices])
 
-        self.plux_publisher.publish(plux_msg)
+        self._signal.set()
+        with self._lock:
+            self._queue.append(plux_msg)
 
         return False
 
@@ -89,17 +148,25 @@ class MyPluxThread(threading.Thread):
         self._signal = threading.Event()
         self._node = get_node(PLUX_ROS_NODE)
         self._publisher = self._node.create_publisher(PluxMsg, PLUX_ROS_TOPIC_NAME, get_realtime_qos_profile())
-
+        
         self.publisher = log_publisher
 
         self.plux_device = self._initialize_plux_device()
         
-        self._node.get_logger().info(f"Plux device started : version {plux.version}")
+        self._node.get_logger().info(f"Plux device started : info {self.plux_device.getProperties()}")
+        self._node.get_logger().info(f"Battery = {self.plux_device.getBattery()}")
+        self.plux_device.setTimeout(-1) # never timeout
+
         self.publisher.publish(
             Header(frame_id = "Plux Info: Plux Started")
         )
 
         self._signal.set()
+        self._node.create_timer(
+            1.0/PLUX_SAMPLING_FREQUENCY,
+            self.plux_device.loop
+        )
+
 
     def _initialize_plux_device(self):
         while True:
@@ -114,16 +181,17 @@ class MyPluxThread(threading.Thread):
                 time.sleep(_RECONNECTION_SLEEP)
 
     def run(self):
+        return
         self._signal.wait()
         while self._signal.is_set():
             try:
                 self.plux_device.loop()
-            except RuntimeError:
-                self._node.get_logger().warning("Lost connection to plux, attempting to reconnect...")
+            except RuntimeError as e:
+                self._node.get_logger().warning(f"Lost connection to plux [err: {e}], attempting to reconnect...")
 
-                self.plux_device = self._initialize_plux_device()
+                # self.plux_device = self._initialize_plux_device()
 
-                self._node.get_logger().info("Re-established connection")
+                # self._node.get_logger().info("Re-established connection")
 
     def signal_handler(self, sig, frame):
         self.publisher.publish(
