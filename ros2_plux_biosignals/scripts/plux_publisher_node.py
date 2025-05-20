@@ -8,7 +8,7 @@ import rclpy
 import signal
 
 # Project based / ROS imports
-from ros2_plux_biosignals.plux_publisher import MyPluxThread, MyPluxDevice
+from ros2_plux_biosignals.plux_publisher import MyPluxDevice
 from ros2_plux_biosignals.plux_configs import *
 from python_utils.ros2_utils.comms.node_manager import create_simple_node, get_realtime_qos_profile
 from std_msgs.msg import Header
